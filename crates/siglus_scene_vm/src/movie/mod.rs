@@ -347,6 +347,10 @@ struct OmvStreamState {
     /// Engine frames since this stream was last polled (Vita eviction).
     #[cfg(target_os = "vita")]
     idle_frames: u32,
+    /// wasm has no worker thread: the decoder runs here, a step at a time,
+    /// from drain_omv_stream_state.
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    producer: Option<Box<OmvInlineProducer>>,
 }
 
 impl Drop for OmvStreamState {
@@ -797,17 +801,21 @@ impl MovieManager {
         loop_flag: bool,
     ) -> Result<Option<MovieStreamFrame>> {
         let path = self.resolve_mov_path_cached(file_name)?;
-        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-        {
-            return self.poll_cached_movie_frame_for_path_with_loop(path, timer_ms, loop_flag);
-        }
         let ext = path
             .extension()
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
         if ext == "omv" {
+            // Streams on every target: on wasm through OmvInlineProducer and
+            // ranged reads, since a whole OMV (op00 is 433 MB) does not fit.
             return self.poll_omv_stream_frame_for_path(path, timer_ms, loop_flag);
+        }
+        // MPEG2/WMV stream on worker threads, which wasm does not have: there
+        // they go through the whole-file cached decoder instead.
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            return self.poll_cached_movie_frame_for_path_with_loop(path, timer_ms, loop_flag);
         }
         if is_wmv_extension(&ext) {
             return self.poll_wmv_stream_frame_for_path(path, timer_ms, loop_flag);
@@ -1005,6 +1013,15 @@ impl MovieManager {
             let cancel = Arc::new(AtomicBool::new(false));
             let worker_cancel = cancel.clone();
             let worker_path = path.to_path_buf();
+            // wasm32-unknown-unknown has no threads, and decoding a whole
+            // movie's audio inline would stall the page, so these movies
+            // play silent there. (Key's OMV movies take another path.)
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            {
+                let _ = (&worker_path, &worker_cancel);
+                let _ = tx.send(Err("no mpeg2 audio decode on wasm".to_string()));
+            }
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             thread::spawn(move || {
                 lower_worker_thread_priority();
                 let result = decode_mpeg2_audio_for_path(&worker_path, worker_cancel.as_ref())
@@ -1196,6 +1213,15 @@ impl MovieManager {
             let cancel = Arc::new(AtomicBool::new(false));
             let worker_cancel = cancel.clone();
             let worker_path = path.to_path_buf();
+            // wasm32-unknown-unknown has no threads, and decoding a whole
+            // movie's audio inline would stall the page, so these movies
+            // play silent there. (Key's OMV movies take another path.)
+            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+            {
+                let _ = (&worker_path, &worker_cancel);
+                let _ = tx.send(Err("no wmv audio decode on wasm".to_string()));
+            }
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             thread::spawn(move || {
                 lower_worker_thread_priority();
                 let result = decode_wmv_audio_for_path(&worker_path, worker_cancel.as_ref())
@@ -1580,9 +1606,8 @@ fn decode_frames_if_enabled(_path: &Path) -> Result<Option<usize>> {
 fn read_file_prefix(path: &Path, max_len: usize) -> Result<Vec<u8>> {
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     {
-        let mut out = read_movie_bytes(path)?;
-        out.truncate(max_len.min(out.len()));
-        return Ok(out);
+        return crate::resource::read_file_range(path, 0, max_len)
+            .with_context(|| format!("read movie prefix: {}", path.display()));
     }
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     {
@@ -1634,6 +1659,14 @@ fn spawn_mpeg2_stream_state(
     audio: Option<MovieAudio>,
     target_ms: u64,
 ) -> Result<Mpeg2StreamState> {
+    // The decoder runs on a worker thread, which wasm32-unknown-unknown
+    // cannot start: the spawn panics and takes the VM with it. Fail the movie
+    // instead, so the script carries on without it.
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        let _ = (&path, &audio, target_ms);
+        bail!("MPEG2 movie streaming needs threads, which wasm does not have: {}", path.display());
+    }
     let prefix = read_file_prefix(&path, MPEG2_HEADER_PROBE_BYTES)?;
     let mut width = None;
     let mut height = None;
@@ -2289,6 +2322,14 @@ fn spawn_wmv_stream_state(
     audio: Option<MovieAudio>,
     target_ms: u64,
 ) -> Result<WmvStreamState> {
+    // The decoder runs on a worker thread, which wasm32-unknown-unknown
+    // cannot start: the spawn panics and takes the VM with it. Fail the movie
+    // instead, so the script carries on without it.
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        let _ = (&path, &audio, target_ms);
+        bail!("WMV movie streaming needs threads, which wasm does not have: {}", path.display());
+    }
     let info = probe_wmv_movie_info(&path)?;
     let (tx, rx) = mpsc::sync_channel(WMV_STREAM_CHANNEL_CAPACITY);
     let request_ms = Arc::new(AtomicUsize::new(
@@ -2575,6 +2616,13 @@ fn spawn_omv_stream_state(path: PathBuf) -> Result<OmvStreamState> {
     let (tx, rx) = mpsc::sync_channel(OMV_STREAM_CHANNEL_CAPACITY);
     let request_frame = Arc::new(AtomicUsize::new(0));
     let worker_request_frame = request_frame.clone();
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    let producer = Some(Box::new(OmvInlineProducer::open(
+        path.clone(),
+        tx,
+        worker_request_frame,
+    )?));
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     thread::spawn(move || {
         lower_worker_thread_priority();
         let result = stream_omv_video_worker(path.as_path(), tx.clone(), worker_request_frame);
@@ -2602,7 +2650,251 @@ fn spawn_omv_stream_state(path: PathBuf) -> Result<OmvStreamState> {
         held_frame: None,
         #[cfg(target_os = "vita")]
         idle_frames: 0,
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        producer,
     })
+}
+
+/// stream_omv_video_worker for a target without threads: the same decode,
+/// one bounded step per drain instead of a loop on its own thread. It keeps
+/// the worker's channel, so everything that consumes the stream is shared.
+/// Sends never block - a full channel waits for the next drain - since a
+/// single thread blocked on its own channel would never wake up.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+struct OmvInlineProducer {
+    path: PathBuf,
+    omv: siglus_assets::omv::OmvFile,
+    video_tf: siglus_omv_decoder::TheoraVideoStream<OmvOggReader>,
+    vinfo: siglus_omv_decoder::VideoInfo,
+    display_h: i32,
+    theora_type: u32,
+    width: u32,
+    height: u32,
+    pool: OmvFramePool,
+    tx: mpsc::SyncSender<Result<OmvStreamEvent, String>>,
+    request_frame: Arc<AtomicUsize>,
+    total_frames: usize,
+    next_frame_idx: usize,
+    last_requested_frame: usize,
+    eof_reported: bool,
+    pending: VecDeque<Result<OmvStreamEvent, String>>,
+    stopped: bool,
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+impl OmvInlineProducer {
+    /// Frames decoded per drain at most, so a movie cannot stall a frame.
+    const FRAMES_PER_PUMP: usize = 2;
+
+    fn open(
+        path: PathBuf,
+        tx: mpsc::SyncSender<Result<OmvStreamEvent, String>>,
+        request_frame: Arc<AtomicUsize>,
+    ) -> Result<Self> {
+        let omv = omv_open_index(&path)
+            .with_context(|| format!("open OMV index: {}", path.display()))?;
+        let reader = omv_ogg_reader(&omv, &path)
+            .with_context(|| format!("open embedded Ogg stream: {}", path.display()))?;
+        let video_tf = siglus_omv_decoder::TheoraVideoStream::open(reader)
+            .with_context(|| format!("open streaming Theora decoder: {}", path.display()))?;
+        let vinfo = video_tf.info();
+        let display_w = omv.header.display_width as i32;
+        let display_h = omv.header.display_height as i32;
+        let width = display_w.max(1) as u32;
+        let height = display_h.max(1) as u32;
+        let fps = if omv.header.frame_time_us != 0 {
+            Some(1_000_000.0 / (omv.header.frame_time_us as f32))
+        } else if vinfo.fps > 0.0 {
+            Some(vinfo.fps as f32)
+        } else {
+            None
+        };
+        let frame_time_ms = omv_frame_duration_ms(Some(&omv.header), fps);
+        let total_frames_hint = (!omv.packets.is_empty())
+            .then_some(omv.packets.len())
+            .or_else(|| {
+                (omv.header.packet_count_hint > 0).then_some(omv.header.packet_count_hint as usize)
+            });
+        let frame_times = Arc::new(
+            omv.packets
+                .iter()
+                .map(|packet| {
+                    (
+                        u64::try_from(packet.frame_time_start.max(0)).unwrap_or(0),
+                        u64::try_from(packet.frame_time_end.max(0)).unwrap_or(0),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        let total_ms_hint = frame_times.last().map(|(_, end)| *end).filter(|end| *end > 0);
+        let theora_type = omv.header.theora_type;
+        let mut pending = VecDeque::new();
+        pending.push_back(Ok(OmvStreamEvent::Info {
+            width,
+            height,
+            fps,
+            frame_time_ms,
+            total_frames_hint,
+            total_ms_hint,
+            frame_times,
+        }));
+        Ok(Self {
+            path,
+            omv,
+            video_tf,
+            vinfo,
+            display_h,
+            theora_type,
+            width,
+            height,
+            pool: OmvFramePool::default(),
+            tx,
+            request_frame,
+            total_frames: total_frames_hint.unwrap_or(0),
+            next_frame_idx: 0,
+            last_requested_frame: 0,
+            eof_reported: false,
+            pending,
+            stopped: false,
+        })
+    }
+
+    /// Hands queued events to the channel; false once it is full or gone.
+    fn flush(&mut self) -> bool {
+        while let Some(event) = self.pending.pop_front() {
+            match self.tx.try_send(event) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(event)) => {
+                    self.pending.push_front(event);
+                    return false;
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    self.stopped = true;
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn pump(&mut self) {
+        if self.stopped || !self.flush() {
+            return;
+        }
+        if let Err(err) = self.step() {
+            self.pending.push_back(Err(format!("{:#}", err)));
+            self.flush();
+            self.stopped = true;
+        }
+    }
+
+    /// One pass of stream_omv_video_worker's loop body.
+    fn step(&mut self) -> Result<()> {
+        let requested = self.request_frame.load(Ordering::Acquire);
+        if requested == usize::MAX {
+            self.stopped = true;
+            return Ok(());
+        }
+        let target_frame = if self.total_frames > 0 {
+            requested.min(self.total_frames.saturating_sub(1))
+        } else {
+            requested
+        };
+
+        if omv_should_index_seek(&self.omv, self.last_requested_frame, target_frame) {
+            let seek_result = self.omv.seek_point_for_frame(target_frame).and_then(|point| {
+                self.video_tf.seek_to_indexed_frame(
+                    point.file_offset,
+                    point.key_page_file_offset,
+                    point.first_packet_no,
+                    point.key_frame_packet_no,
+                    point.target_packet_no,
+                )
+            });
+            let packed = match seek_result {
+                Ok(frame) => frame,
+                Err(index_err) => {
+                    eprintln!(
+                        "[SG_MOV] OMV indexed seek fallback path={} frame={} err={:#}",
+                        self.path.display(),
+                        target_frame,
+                        index_err
+                    );
+                    let reader = omv_ogg_reader(&self.omv, &self.path)?;
+                    let mut restarted = siglus_omv_decoder::TheoraVideoStream::open(reader)?;
+                    let mut frame = None;
+                    for _ in 0..=target_frame {
+                        frame = restarted.read_video_frame()?;
+                        if frame.is_none() {
+                            break;
+                        }
+                    }
+                    self.video_tf = restarted;
+                    frame
+                }
+            };
+            self.pending.push_back(Ok(OmvStreamEvent::Reset { frame_idx: target_frame }));
+            if let Some(buf) = packed {
+                let event = build_omv_video_event(
+                    &mut self.pool,
+                    target_frame,
+                    &buf,
+                    self.vinfo,
+                    self.display_h,
+                    self.theora_type,
+                    self.width,
+                    self.height,
+                );
+                self.pending.push_back(Ok(event));
+            }
+            self.next_frame_idx = target_frame.saturating_add(1);
+            self.eof_reported = false;
+        }
+
+        self.last_requested_frame = target_frame;
+        let decode_until = if self.total_frames > 0 {
+            target_frame
+                .saturating_add(OMV_STREAM_DECODE_LEAD_FRAMES)
+                .min(self.total_frames.saturating_sub(1))
+        } else {
+            target_frame.saturating_add(OMV_STREAM_DECODE_LEAD_FRAMES)
+        };
+        let mut decoded = 0;
+        while self.next_frame_idx <= decode_until && decoded < Self::FRAMES_PER_PUMP {
+            if !self.flush() {
+                return Ok(());
+            }
+            let (vinfo, display_h, theora_type, width, height) =
+                (self.vinfo, self.display_h, self.theora_type, self.width, self.height);
+            let pool = &mut self.pool;
+            let Some(frame) = self.video_tf.read_video_frame_with(|ycbcr| {
+                omv_rgba_frame(
+                    &DecoderOmvPlanes(ycbcr),
+                    vinfo,
+                    display_h,
+                    theora_type,
+                    width,
+                    height,
+                    pool,
+                )
+            })?
+            else {
+                if !self.eof_reported {
+                    self.pending.push_back(Ok(OmvStreamEvent::Done));
+                    self.eof_reported = true;
+                }
+                break;
+            };
+            self.pending.push_back(Ok(OmvStreamEvent::Video {
+                frame_idx: self.next_frame_idx,
+                frame,
+            }));
+            self.next_frame_idx = self.next_frame_idx.saturating_add(1);
+            decoded += 1;
+        }
+        self.flush();
+        Ok(())
+    }
 }
 
 fn stream_omv_video_worker(
@@ -2610,10 +2902,9 @@ fn stream_omv_video_worker(
     tx: mpsc::SyncSender<Result<OmvStreamEvent, String>>,
     request_frame: Arc<AtomicUsize>,
 ) -> Result<()> {
-    let omv = siglus_assets::omv::OmvFile::open(path)
+    let omv = omv_open_index(path)
         .with_context(|| format!("open OMV index: {}", path.display()))?;
-    let reader = omv
-        .open_embedded_ogg_reader(path)
+    let reader = omv_ogg_reader(&omv, path)
         .with_context(|| format!("open embedded Ogg stream: {}", path.display()))?;
     let mut video_tf = siglus_omv_decoder::TheoraVideoStream::open(reader)
         .with_context(|| format!("open streaming Theora decoder: {}", path.display()))?;
@@ -2705,7 +2996,7 @@ fn stream_omv_video_worker(
                         target_frame,
                         index_err
                     );
-                    let reader = omv.open_embedded_ogg_reader(path).with_context(|| {
+                    let reader = omv_ogg_reader(&omv, path).with_context(|| {
                         format!("reopen embedded Ogg stream: {}", path.display())
                     })?;
                     let mut restarted = siglus_omv_decoder::TheoraVideoStream::open(reader)
@@ -2843,6 +3134,24 @@ fn send_omv_video_frame(
     width: u32,
     height: u32,
 ) -> Result<bool> {
+    let event = build_omv_video_event(
+        pool, frame_idx, buf, vinfo, display_h, theora_type, width, height,
+    );
+    Ok(tx.send(Ok(event)).is_ok())
+}
+
+/// One packed Theora frame as a Video event, shared by the worker and the
+/// single-threaded wasm producer.
+fn build_omv_video_event(
+    pool: &mut OmvFramePool,
+    frame_idx: usize,
+    buf: &[u8],
+    vinfo: siglus_omv_decoder::VideoInfo,
+    display_h: i32,
+    theora_type: u32,
+    width: u32,
+    height: u32,
+) -> OmvStreamEvent {
     let (uv_w, _uv_h, y_plane_len, u_plane_len, _v_plane_len) =
         omv_plane_layout(vinfo.frame_width, vinfo.frame_height, vinfo.fmt);
     let planes = PackedOmvPlanes {
@@ -2851,9 +3160,7 @@ fn send_omv_video_frame(
         widths: [vinfo.frame_width.max(1) as usize, uv_w, uv_w],
     };
     let frame = omv_rgba_frame(&planes, vinfo, display_h, theora_type, width, height, pool);
-    Ok(tx
-        .send(Ok(OmvStreamEvent::Video { frame_idx, frame }))
-        .is_ok())
+    OmvStreamEvent::Video { frame_idx, frame }
 }
 
 /// One OMV frame converted for display (downscaled on consoles, see
@@ -3045,6 +3352,10 @@ fn drain_omv_stream_state(
     retain_from_start: bool,
     cache_loop_head: bool,
 ) -> Result<()> {
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    if let Some(producer) = state.producer.as_mut() {
+        producer.pump();
+    }
     for _ in 0..OMV_STREAM_MAX_DRAIN_EVENTS {
         match state.rx.try_recv() {
             Ok(Ok(OmvStreamEvent::Info {
@@ -3851,8 +4162,46 @@ fn read_movie_bytes(path: &Path) -> Result<Vec<u8>> {
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 fn read_omv_header_for_path(path: &Path) -> Result<siglus_assets::omv::OmvHeader> {
-    let bytes = read_movie_bytes(path)?;
+    let bytes = crate::resource::read_file_range(path, 0, 0x58)
+        .with_context(|| format!("read OMV header: {}", path.display()))?;
     read_omv_header_from_bytes(&bytes)
+}
+
+/// The OMV index, read through the native filesystem or, on wasm, ranged
+/// host reads - never the whole container.
+fn omv_open_index(path: &Path) -> Result<siglus_assets::omv::OmvFile> {
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        let reader = crate::wasm_vfs::VfsSeekReader::open(&path.to_string_lossy())?;
+        let len = reader.len();
+        return siglus_assets::omv::OmvFile::open_from_reader(
+            reader,
+            len,
+            &path.display().to_string(),
+        );
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        siglus_assets::omv::OmvFile::open(path)
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+type OmvOggReader = crate::wasm_vfs::VfsSeekReader;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+type OmvOggReader = BufReader<fs::File>;
+
+/// A reader positioned at the OMV's embedded Ogg stream, per target.
+fn omv_ogg_reader(omv: &siglus_assets::omv::OmvFile, path: &Path) -> Result<OmvOggReader> {
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        let reader = crate::wasm_vfs::VfsSeekReader::open(&path.to_string_lossy())?;
+        return omv.embedded_ogg_from_reader(reader);
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        omv.open_embedded_ogg_reader(path)
+    }
 }
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -4386,23 +4735,11 @@ fn decode_mpeg2_preview_frame(path: &Path) -> Result<Arc<RgbaImage>> {
 }
 
 fn decode_omv_preview_frame(path: &Path) -> Result<Arc<RgbaImage>> {
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    // Frame 0 only, on every target: open the index, stream, read one frame.
     {
-        let bytes = read_movie_bytes(path)?;
-        let asset = decode_omv_asset_from_bytes(path, bytes)?;
-        return asset
-            .frames
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("omv preview frame missing: {}", path.display()));
-    }
-
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    {
-        let omv = siglus_assets::omv::OmvFile::open(path)
+        let omv = omv_open_index(path)
             .with_context(|| format!("open OMV index: {}", path.display()))?;
-        let reader = omv
-            .open_embedded_ogg_reader(path)
+        let reader = omv_ogg_reader(&omv, path)
             .with_context(|| format!("open embedded Ogg stream: {}", path.display()))?;
         let mut stream = siglus_omv_decoder::TheoraVideoStream::open(reader)
             .with_context(|| format!("open streaming Theora decoder: {}", path.display()))?;

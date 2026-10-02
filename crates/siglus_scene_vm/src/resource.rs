@@ -107,6 +107,67 @@ pub fn read_file_bytes(path: &Path) -> Result<Vec<u8>> {
     }
 }
 
+/// Up to `len` bytes of `path` from `offset`, without reading the rest of the
+/// file. On the browser build this is one ranged host read.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub fn read_file_range(path: &Path, offset: u64, len: usize) -> Result<Vec<u8>> {
+    crate::wasm_vfs::WasmDirectoryVfs::new().read_range(&path_to_wasm_vfs(path), offset, len)
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub fn read_file_range(path: &Path, offset: u64, len: usize) -> Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let Some(resolved) = resolve_windows_case_insensitive_file(path)? else {
+        bail!("file not found: {}", path.display());
+    };
+    let mut file = fs::File::open(&resolved)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut out = Vec::with_capacity(len);
+    file.take(len as u64).read_to_end(&mut out)?;
+    Ok(out)
+}
+
+/// Writes a whole file (saves). The browser build hands it to the host, which
+/// keeps it; there is no directory to create there.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub fn write_file_bytes(path: &Path, data: &[u8]) -> Result<()> {
+    crate::wasm_vfs::WasmDirectoryVfs::new().write_all(&path_to_wasm_vfs(path), data)
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub fn write_file_bytes(path: &Path, data: &[u8]) -> Result<()> {
+    fs::write(path, data)?;
+    Ok(())
+}
+
+/// `fs::create_dir_all`, except on the browser build, whose host storage is
+/// keyed by path and has no directories to make.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub fn create_dir_all(_dir: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub fn create_dir_all(dir: &Path) -> Result<()> {
+    fs::create_dir_all(dir)?;
+    Ok(())
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub fn ensure_parent_dir(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub fn ensure_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub fn read_file_to_string(path: &Path) -> Result<String> {
     let bytes = read_file_bytes(path)?;

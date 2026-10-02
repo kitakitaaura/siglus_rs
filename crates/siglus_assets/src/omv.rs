@@ -100,10 +100,21 @@ impl OmvFile {
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let mut file = File::open(path).with_context(|| format!("open OMV: {}", path.display()))?;
+        let file = File::open(path).with_context(|| format!("open OMV: {}", path.display()))?;
+        let file_len = file
+            .metadata()
+            .with_context(|| format!("stat OMV: {}", path.display()))?
+            .len();
+        Self::open_from_reader(file, file_len, &path.display().to_string())
+    }
+
+    /// [`Self::open`] over any seekable source of the whole file, for hosts
+    /// without a native filesystem (the browser build reads through ranged
+    /// requests). `label` names the file in errors.
+    pub fn open_from_reader<R: Read + Seek>(mut file: R, file_len: u64, label: &str) -> Result<Self> {
         let mut header_prefix = [0u8; OMV_HEADER_MIN_SIZE];
         file.read_exact(&mut header_prefix)
-            .with_context(|| format!("read OMV header: {}", path.display()))?;
+            .with_context(|| format!("read OMV header: {label}"))?;
         let header = read_header(&header_prefix)?;
         let header_size = usize::try_from(header.header_size)
             .map_err(|_| anyhow!("OMV header size does not fit usize"))?;
@@ -112,7 +123,7 @@ impl OmvFile {
         }
 
         file.seek(SeekFrom::Start(header.header_size as u64))
-            .with_context(|| format!("seek OMV tables: {}", path.display()))?;
+            .with_context(|| format!("seek OMV tables: {label}"))?;
 
         let page_count = usize::try_from(header.page_count_hint)
             .map_err(|_| anyhow!("OMV page count does not fit usize"))?;
@@ -128,10 +139,6 @@ impl OmvFile {
             .checked_add(pages_bytes as u64)
             .and_then(|offset| offset.checked_add(packets_bytes as u64))
             .ok_or_else(|| anyhow!("OMV table end offset overflow"))?;
-        let file_len = file
-            .metadata()
-            .with_context(|| format!("stat OMV: {}", path.display()))?
-            .len();
         if seek_top > file_len {
             bail!(
                 "OMV seek tables exceed file size: table_end={} file_size={}",
@@ -143,12 +150,12 @@ impl OmvFile {
         let mut page_table = vec![0u8; pages_bytes];
         if !page_table.is_empty() {
             file.read_exact(&mut page_table)
-                .with_context(|| format!("read OMV page table: {}", path.display()))?;
+                .with_context(|| format!("read OMV page table: {label}"))?;
         }
         let mut packet_table = vec![0u8; packets_bytes];
         if !packet_table.is_empty() {
             file.read_exact(&mut packet_table)
-                .with_context(|| format!("read OMV packet table: {}", path.display()))?;
+                .with_context(|| format!("read OMV packet table: {label}"))?;
         }
 
         let pages = parse_pages(&page_table, page_count)?;
@@ -307,6 +314,14 @@ impl OmvFile {
         })
     }
 
+    /// Positions `reader` (the whole OMV file) at the embedded Ogg bitstream.
+    pub fn embedded_ogg_from_reader<R: Seek>(&self, mut reader: R) -> Result<R> {
+        reader
+            .seek(SeekFrom::Start(self.ogg_data_offset))
+            .context("seek embedded Ogg")?;
+        Ok(reader)
+    }
+
     /// Open a buffered reader positioned at the embedded Ogg bitstream.
     pub fn open_embedded_ogg_reader(&self, path: impl AsRef<Path>) -> Result<BufReader<File>> {
         let path = path.as_ref();
@@ -430,7 +445,7 @@ fn read_i32(buf: &[u8], offset: usize) -> Result<i32> {
     Ok(read_u32(buf, offset)? as i32)
 }
 
-fn file_has_ogg_magic(file: &mut File, offset: u64) -> Result<bool> {
+fn file_has_ogg_magic<R: Read + Seek>(file: &mut R, offset: u64) -> Result<bool> {
     file.seek(SeekFrom::Start(offset))?;
     let mut magic = [0u8; 4];
     match file.read_exact(&mut magic) {
@@ -440,7 +455,7 @@ fn file_has_ogg_magic(file: &mut File, offset: u64) -> Result<bool> {
     }
 }
 
-fn find_ogg_offset_in_file(file: &mut File, start: u64) -> Result<u64> {
+fn find_ogg_offset_in_file<R: Read + Seek>(file: &mut R, start: u64) -> Result<u64> {
     file.seek(SeekFrom::Start(start))?;
     let mut absolute = start;
     let mut carry = Vec::<u8>::new();

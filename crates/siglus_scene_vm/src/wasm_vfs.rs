@@ -29,6 +29,17 @@ extern "C" {
 
     #[wasm_bindgen(js_name = siglusKnownFileCount)]
     fn siglus_known_file_count() -> u32;
+
+    // noberu: ranged reads, sizes and writes. A 433 MB movie read whole (twice)
+    // does not fit a 32-bit heap, and saves need somewhere to go.
+    #[wasm_bindgen(js_name = siglusReadRange)]
+    fn siglus_read_range(path: &str, offset: f64, len: u32) -> Uint8Array;
+
+    #[wasm_bindgen(js_name = siglusFileSize)]
+    fn siglus_file_size(path: &str) -> f64;
+
+    #[wasm_bindgen(js_name = siglusWriteFile)]
+    fn siglus_write_file(path: &str, data: &[u8]);
 }
 
 /// Path-based filesystem surface used by the wasm port.
@@ -42,6 +53,11 @@ pub trait SiglusVfs {
     fn exists(&self, path: &str) -> bool;
     fn read_all(&self, path: &str) -> Result<Vec<u8>>;
     fn list_dir(&self, path: &str) -> Result<Vec<String>>;
+    /// Up to `len` bytes from `offset`; shorter at the end of the file.
+    fn read_range(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>>;
+    fn file_size(&self, path: &str) -> Result<u64>;
+    /// Creates or replaces the file (saves). The host keeps it.
+    fn write_all(&self, path: &str, data: &[u8]) -> Result<()>;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -78,6 +94,35 @@ impl SiglusVfs for WasmDirectoryVfs {
         Ok(out)
     }
 
+    fn read_range(&self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let normalized = normalize_siglus_path(path);
+        if !siglus_file_exists(&normalized) {
+            bail!("wasm resource not found: {normalized}");
+        }
+        let len = u32::try_from(len).map_err(|_| anyhow!("range too large: {len}"))?;
+        let arr = siglus_read_range(&normalized, offset as f64, len);
+        let mut out = vec![0u8; arr.length() as usize];
+        arr.copy_to(&mut out);
+        Ok(out)
+    }
+
+    fn file_size(&self, path: &str) -> Result<u64> {
+        let normalized = normalize_siglus_path(path);
+        if !siglus_file_exists(&normalized) {
+            bail!("wasm resource not found: {normalized}");
+        }
+        Ok(siglus_file_size(&normalized).max(0.0) as u64)
+    }
+
+    fn write_all(&self, path: &str, data: &[u8]) -> Result<()> {
+        let normalized = normalize_siglus_path(path);
+        if normalized.is_empty() {
+            bail!("empty wasm resource path");
+        }
+        siglus_write_file(&normalized, data);
+        Ok(())
+    }
+
     fn list_dir(&self, path: &str) -> Result<Vec<String>> {
         let normalized = normalize_siglus_path(path);
         let array = siglus_list_dir(&normalized);
@@ -91,6 +136,72 @@ impl SiglusVfs for WasmDirectoryVfs {
             out.push(s);
         }
         Ok(out)
+    }
+}
+
+/// `Read + Seek` over one file through ranged reads, so a decoder can walk a
+/// large container (a 433 MB OMV) without the whole thing in memory. Reads
+/// go through a sliding window, so sequential Ogg reads cost one host call
+/// per window rather than one per read.
+pub struct VfsSeekReader {
+    path: String,
+    len: u64,
+    pos: u64,
+    window_start: u64,
+    window: Vec<u8>,
+}
+
+const VFS_READER_WINDOW: usize = 256 * 1024;
+
+impl VfsSeekReader {
+    pub fn open(path: &str) -> Result<Self> {
+        let path = normalize_siglus_path(path);
+        let len = WasmDirectoryVfs::new().file_size(&path)?;
+        Ok(Self { path, len, pos: 0, window_start: 0, window: Vec::new() })
+    }
+
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+}
+
+impl std::io::Read for VfsSeekReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() || self.pos >= self.len {
+            return Ok(0);
+        }
+        let in_window = self.pos >= self.window_start
+            && self.pos < self.window_start + self.window.len() as u64;
+        if !in_window {
+            let want = VFS_READER_WINDOW.max(buf.len()).min((self.len - self.pos) as usize);
+            self.window = WasmDirectoryVfs::new()
+                .read_range(&self.path, self.pos, want)
+                .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
+            self.window_start = self.pos;
+            if self.window.is_empty() {
+                return Ok(0);
+            }
+        }
+        let at = (self.pos - self.window_start) as usize;
+        let n = buf.len().min(self.window.len() - at);
+        buf[..n].copy_from_slice(&self.window[at..at + n]);
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl std::io::Seek for VfsSeekReader {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        let next = match to {
+            std::io::SeekFrom::Start(n) => n as i128,
+            std::io::SeekFrom::End(n) => self.len as i128 + n as i128,
+            std::io::SeekFrom::Current(n) => self.pos as i128 + n as i128,
+        };
+        if next < 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "seek before start"));
+        }
+        self.pos = next as u64;
+        Ok(self.pos)
     }
 }
 

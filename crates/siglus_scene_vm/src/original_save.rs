@@ -1110,7 +1110,7 @@ pub fn write_header_in_place(path: &Path, header: &OriginalSaveHeader) -> Result
             bail!("save file too short for header update: {}", path.display());
         }
         data[..header.header_size()].copy_from_slice(&header.to_bytes());
-        fs::write(path, data).with_context(|| format!("write save file {}", path.display()))?;
+        crate::resource::write_file_bytes(path, &data).with_context(|| format!("write save file {}", path.display()))?;
         crate::resource::invalidate_game_path_cache(path);
         Ok(())
     }
@@ -1127,10 +1127,10 @@ pub fn write_local_save_file(
     let mut out = header.to_bytes();
     out.extend_from_slice(&packed);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
+        crate::resource::create_dir_all(parent)
             .with_context(|| format!("create save dir {}", parent.display()))?;
     }
-    fs::write(path, out).with_context(|| format!("write save file {}", path.display()))?;
+    crate::resource::write_file_bytes(path, &out).with_context(|| format!("write save file {}", path.display()))?;
     crate::resource::invalidate_game_path_cache(path);
     Ok(())
 }
@@ -1213,12 +1213,12 @@ pub fn write_global_save_file(project_dir: &Path, global_stream: &[u8]) -> Resul
     };
     let path = save_dir(project_dir).join("global.sav");
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
+        crate::resource::create_dir_all(parent)
             .with_context(|| format!("create save dir {}", parent.display()))?;
     }
     let mut out = header.to_bytes();
     out.extend_from_slice(&packed);
-    fs::write(&path, out).with_context(|| format!("write global save file {}", path.display()))?;
+    crate::resource::write_file_bytes(&path, &out).with_context(|| format!("write global save file {}", path.display()))?;
     crate::resource::invalidate_game_path_cache(&path);
     Ok(())
 }
@@ -1261,7 +1261,7 @@ pub fn write_read_save_file(project_dir: &Path, scene_rows: &[(String, Vec<u8>)]
     let packed = pack_buffer(&stream.into_inner());
     let path = save_dir(project_dir).join("read.sav");
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
+        crate::resource::create_dir_all(parent)
             .with_context(|| format!("create save dir {}", parent.display()))?;
     }
     let mut out = Vec::with_capacity(16 + packed.len());
@@ -1270,7 +1270,7 @@ pub fn write_read_save_file(project_dir: &Path, scene_rows: &[(String, Vec<u8>)]
     push_i32(&mut out, packed.len().min(i32::MAX as usize) as i32);
     push_i32(&mut out, scene_rows.len().min(i32::MAX as usize) as i32);
     out.extend_from_slice(&packed);
-    fs::write(&path, out).with_context(|| format!("write read save file {}", path.display()))?;
+    crate::resource::write_file_bytes(&path, &out).with_context(|| format!("write read save file {}", path.display()))?;
     crate::resource::invalidate_game_path_cache(&path);
     Ok(())
 }
@@ -1337,12 +1337,12 @@ pub fn write_config_save_file(project_dir: &Path, config_stream: &[u8]) -> Resul
     };
     let path = save_dir(project_dir).join("config.sav");
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
+        crate::resource::create_dir_all(parent)
             .with_context(|| format!("create save dir {}", parent.display()))?;
     }
     let mut out = header.to_bytes();
     out.extend_from_slice(&packed);
-    fs::write(&path, out).with_context(|| format!("write config save file {}", path.display()))?;
+    crate::resource::write_file_bytes(&path, &out).with_context(|| format!("write config save file {}", path.display()))?;
     crate::resource::invalidate_game_path_cache(&path);
     Ok(())
 }

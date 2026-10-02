@@ -11519,6 +11519,13 @@ fn dispatch_object_state_op(
             }
         }
 
+        let size_query = compact_size_alias_x
+            || compact_size_alias_y
+            || (ctx.ids.obj_get_size_x != 0 && op == ctx.ids.obj_get_size_x)
+            || (ctx.ids.obj_get_size_y != 0 && op == ctx.ids.obj_get_size_y);
+        if size_query && let Some(name) = obj.file_name.as_deref() {
+            ctx.note_script_size_probe(name);
+        }
         if compact_size_alias_x || (ctx.ids.obj_get_size_x != 0 && op == ctx.ids.obj_get_size_x) {
             ctx.stack.push(Value::Int(sx));
             if sg_title_hit_trace_enabled()

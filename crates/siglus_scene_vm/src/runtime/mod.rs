@@ -571,6 +571,11 @@ pub struct CommandContext {
     frame_clock_sub_ms_ns: u32,
     last_button_hover_sound_pos: Option<(i32, i32)>,
     suppress_next_right_syscom_open: bool,
+    /// Images the script keeps asking the size of (OBJECT.GET_SIZE_X/Y), by
+    /// file name: when, and how often lately. Script-driven menus (Rewrite+'s
+    /// title) hit-test this way every frame, which marks their items for
+    /// cursor_move_by_key when there are no engine buttons.
+    script_size_probes: HashMap<String, (crate::platform_time::Instant, u32)>,
 }
 
 /// Convert a high-resolution wall-clock interval into the integer-millisecond
@@ -809,6 +814,7 @@ impl CommandContext {
         self.disp_because_msg_wait_cnt = 0;
         self.disp_because_msg_wait_cnt_max = 0;
         self.last_button_hover_sound_pos = None;
+        self.script_size_probes.clear();
         // The save/load menu runs as an EXCALL scene. Loading replaces that
         // script context without executing EXCALL.FREE, so its ready flag must
         // not select the menu-local stage for later game wipes.
@@ -1589,6 +1595,7 @@ impl CommandContext {
             frame_clock_sub_ms_ns: 0,
             last_button_hover_sound_pos: None,
             suppress_next_right_syscom_open: false,
+            script_size_probes: HashMap::default(),
         };
         ctx.set_active_append(initial_append.dir, initial_append.name);
         ctx.apply_gameexe_runtime_defaults();
@@ -2475,6 +2482,181 @@ impl CommandContext {
         if let Some(se_no) = self.button_template_se_no(template_no, event) {
             self.play_button_se_no(se_no);
         }
+    }
+
+    /// Called for every OBJECT.GET_SIZE_X/Y the script makes on an image.
+    pub(crate) fn note_script_size_probe(&mut self, file_name: &str) {
+        let now = crate::platform_time::Instant::now();
+        let entry = self
+            .script_size_probes
+            .entry(file_name.to_string())
+            .or_insert((now, 0));
+        if now.duration_since(entry.0).as_millis() > 1000 {
+            entry.1 = 0;
+        }
+        *entry = (now, entry.1.saturating_add(1));
+    }
+
+    /// Image names the script has been hit-testing: asked about often (a
+    /// one-off layout query does not count), and lately. "Lately" is long,
+    /// because once one item is under the cursor a script may test only that
+    /// one until it leaves; only images still on screen become targets.
+    fn script_hit_test_names(&self) -> HashSet<String> {
+        let now = crate::platform_time::Instant::now();
+        self.script_size_probes
+            .iter()
+            .filter(|(_, (last, count))| {
+                *count >= 5 && now.duration_since(*last).as_millis() <= 10_000
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// SET_MOUSE_MOVE_BY_KEY: the arrow keys move the mouse cursor to the
+    /// next button, as SiglusEngine does, so a menu can be worked from a
+    /// keyboard or a pad. Returns where the cursor went; the caller moves it.
+    /// Nothing happens while the script has turned the behaviour off.
+    pub fn cursor_move_by_key(&mut self, key: input::VmKey) -> Option<(i32, i32)> {
+        if self.globals.script.cursor_move_by_key_disable {
+            return None;
+        }
+        let (dx, dy) = match key {
+            input::VmKey::ArrowLeft => (-1, 0),
+            input::VmKey::ArrowRight => (1, 0),
+            input::VmKey::ArrowUp => (0, -1),
+            input::VmKey::ArrowDown => (0, 1),
+            _ => return None,
+        };
+        let mut targets = self.button_targets();
+        if targets.is_empty() {
+            return None;
+        }
+        // Reading order: top to bottom, then left to right.
+        targets.sort_by_key(|&(x, y)| (y, x));
+        targets.dedup();
+
+        let here = self
+            .input
+            .has_mouse_position()
+            .then(|| (self.input.mouse_x, self.input.mouse_y));
+        let Some((mx, my)) = here else {
+            return Some(if dx + dy > 0 { targets[0] } else { targets[targets.len() - 1] });
+        };
+        let current = targets
+            .iter()
+            .position(|&(x, y)| (x - mx).abs() <= 8 && (y - my).abs() <= 8);
+
+        // The nearest button in the arrow's direction, weighing distance
+        // along the arrow less than distance across it.
+        let best = targets
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| Some(i) != current)
+            .filter_map(|(_, &(x, y))| {
+                let along = (x - mx) * dx + (y - my) * dy;
+                let across = ((x - mx) * dy - (y - my) * dx).abs();
+                (along > 8).then_some((along + across * 2, (x, y)))
+            })
+            .min_by_key(|&(score, _)| score)
+            .map(|(_, point)| point);
+        if best.is_some() {
+            return best;
+        }
+        // Nothing that way (Down on a one-row menu): step through the
+        // buttons in reading order instead, so the pad always moves.
+        let n = targets.len();
+        let next = match current {
+            Some(i) if dx + dy > 0 => (i + 1) % n,
+            Some(i) => (i + n - 1) % n,
+            None if dx + dy > 0 => 0,
+            None => n - 1,
+        };
+        Some(targets[next])
+    }
+
+    /// Screen centres of the buttons a click could act on right now: enabled
+    /// action buttons, standalone or in a choice group that is running.
+    fn button_targets(&mut self) -> Vec<(i32, i32)> {
+        let buttons = self.collect_targets(None);
+        if !buttons.is_empty() {
+            return buttons;
+        }
+        // No engine buttons: a script-driven menu, if the script is
+        // hit-testing images itself.
+        let probed = self.script_hit_test_names();
+        if probed.is_empty() {
+            return buttons;
+        }
+        self.collect_targets(Some(&probed))
+    }
+
+    /// Engine buttons, or with `probed`, the visible images by those names.
+    fn collect_targets(&mut self, probed: Option<&HashSet<String>>) -> Vec<(i32, i32)> {
+        let mut out = Vec::new();
+        let Some(form_id) = self.active_button_stage_form_id() else {
+            return out;
+        };
+        let read_skip_runtime_enabled = self.runtime_read_skip_is_enable();
+        let Some(st) = self.globals.stage_forms.get(&form_id) else {
+            return out;
+        };
+        let images = &mut self.images;
+        let layers = &self.layers;
+        let gfx = &self.gfx;
+        let ids = &self.ids;
+        let syscom = &self.globals.syscom;
+        let doing_groups: HashSet<(i64, usize)> = st
+            .group_lists
+            .iter()
+            .flat_map(|(stage_idx, groups)| {
+                groups
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, g)| g.is_doing())
+                    .map(move |(group_idx, _)| (*stage_idx, group_idx))
+            })
+            .collect();
+        let mut stage_ids: Vec<i64> = st.object_lists.keys().copied().collect();
+        stage_ids.sort_unstable();
+        for stage_idx in stage_ids {
+            let Some(objs) = st.object_lists.get(&stage_idx) else {
+                continue;
+            };
+            for (obj_idx, obj) in objs.iter().enumerate() {
+                if st
+                    .embedded_object_slots_by_stage
+                    .get(&stage_idx)
+                    .is_some_and(|slots| slots.contains(&obj_idx))
+                {
+                    continue;
+                }
+                if !st
+                    .object_slot_use
+                    .get(&stage_idx)
+                    .and_then(|flags| flags.get(obj_idx))
+                    .copied()
+                    .unwrap_or(true)
+                {
+                    continue;
+                }
+                collect_button_targets_recursive(
+                    images,
+                    layers,
+                    gfx,
+                    ids,
+                    syscom,
+                    read_skip_runtime_enabled,
+                    &doing_groups,
+                    probed,
+                    stage_idx,
+                    obj_idx,
+                    obj,
+                    None,
+                    &mut out,
+                );
+            }
+        }
+        out
     }
 
     fn update_object_button_hover(&mut self) {
@@ -9949,6 +10131,131 @@ fn object_button_push_keep_recursive(
         .child_objects
         .iter()
         .any(|child| object_button_push_keep_recursive(child, group_idx, button_no))
+}
+
+/// The screen point at the middle of a sprite's hit box - the inverse of
+/// hit_test_render_sprite for its centre (rotation ignored), kept inside the
+/// sprite's clip.
+fn render_sprite_center(images: &mut ImageManager, sprite: &Sprite) -> Option<(i32, i32)> {
+    if !sprite.visible || sprite.tr == 0 || sprite.scale_x == 0.0 || sprite.scale_y == 0.0 {
+        return None;
+    }
+    let image = sprite
+        .image_id
+        .as_ref()
+        .and_then(|img_id| images.get(img_id));
+    let (intrinsic_w, intrinsic_h) = if let Some(img) = image.as_deref() {
+        (img.width, img.height)
+    } else if let Some(packet) = sprite.emote_render.as_deref() {
+        (packet.width, packet.height)
+    } else {
+        return None;
+    };
+    let (w, h) = match sprite.size_mode {
+        SpriteSizeMode::Intrinsic => (intrinsic_w as f32, intrinsic_h as f32),
+        SpriteSizeMode::Explicit { width, height } => (width as f32, height as f32),
+    };
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    let (anchor_x, anchor_y) = match sprite.fit {
+        SpriteFit::PixelRect => (sprite.x as f32, sprite.y as f32),
+        SpriteFit::FullScreen => (0.0, 0.0),
+    };
+    let (origin_x, origin_y) = if sprite.object_anchor {
+        (anchor_x, anchor_y)
+    } else {
+        (anchor_x + sprite.pivot_x, anchor_y + sprite.pivot_y)
+    };
+    let (tex_center_x, tex_center_y) = if sprite.object_anchor {
+        (sprite.texture_center_x, sprite.texture_center_y)
+    } else {
+        (0.0, 0.0)
+    };
+    let mut x = origin_x + (w / 2.0 - sprite.pivot_x - tex_center_x) * sprite.scale_x;
+    let mut y = origin_y + (h / 2.0 - sprite.pivot_y - tex_center_y) * sprite.scale_y;
+    if let Some(clip) = sprite.dst_clip {
+        if clip.right <= clip.left || clip.bottom <= clip.top {
+            return None;
+        }
+        x = x.clamp(clip.left as f32, (clip.right - 1) as f32);
+        y = y.clamp(clip.top as f32, (clip.bottom - 1) as f32);
+    }
+    Some((x.round() as i32, y.round() as i32))
+}
+
+/// button_targets() for one object and its children, through the same
+/// render state the hit tests use, so a target is where a click would land.
+#[allow(clippy::too_many_arguments)]
+fn collect_button_targets_recursive(
+    images: &mut ImageManager,
+    layers: &LayerManager,
+    gfx: &graphics::GfxRuntime,
+    ids: &constants::RuntimeConstants,
+    syscom: &globals::SyscomRuntimeState,
+    read_skip_runtime_enabled: bool,
+    doing_groups: &HashSet<(i64, usize)>,
+    probed: Option<&HashSet<String>>,
+    stage_idx: i64,
+    obj_idx: usize,
+    obj: &globals::ObjectState,
+    parent_state: Option<ParentRenderState>,
+    out: &mut Vec<(i32, i32)>,
+) {
+    let wanted = match probed {
+        Some(names) => obj.file_name.as_ref().is_some_and(|name| names.contains(name)),
+        None => true,
+    };
+    let registered = probed.is_some() && wanted
+        || probed.is_none()
+        && obj.button.enabled
+        && !obj.base.no_event_hint
+        && obj.button.action_no >= 0
+        && match obj.button.group_idx() {
+            None => true,
+            Some(group_idx) => doing_groups.contains(&(stage_idx, group_idx)),
+        };
+    if registered
+        && object_button_renderable_by_syscom(syscom, obj)
+        && (probed.is_some() || !button_effective_disabled(syscom, obj, None, read_skip_runtime_enabled))
+    {
+        let runtime_slot = object_runtime_slot(obj_idx, obj);
+        let info = button_object_render_info(ids, gfx, stage_idx, obj_idx, obj);
+        for mut rs in fetch_bound_render_sprites_for_hit(layers, gfx, stage_idx, runtime_slot, obj) {
+            apply_button_object_render_info_to_sprite(&mut rs.sprite, &info);
+            if let Some(parent) = parent_state.clone() {
+                let dummy = ObjectRenderInfo::default();
+                apply_parent_render_state_to_sprite(&mut rs.sprite, &dummy, &parent);
+            }
+            finalize_button_object_center_rep_to_sprite(&mut rs.sprite, &info);
+            if let Some(point) = render_sprite_center(images, &rs.sprite) {
+                out.push(point);
+                break;
+            }
+        }
+    }
+    if obj.runtime.child_objects.is_empty() {
+        return;
+    }
+    let cur_parent_state =
+        button_parent_render_state(layers, gfx, ids, stage_idx, obj_idx, obj, parent_state);
+    for (child_idx, child) in obj.runtime.child_objects.iter().enumerate() {
+        collect_button_targets_recursive(
+            images,
+            layers,
+            gfx,
+            ids,
+            syscom,
+            read_skip_runtime_enabled,
+            doing_groups,
+            probed,
+            stage_idx,
+            child_idx,
+            child,
+            Some(cur_parent_state.clone()),
+            out,
+        );
+    }
 }
 
 fn hit_test_render_sprite(

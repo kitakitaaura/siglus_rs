@@ -1266,12 +1266,20 @@ impl KoeEngine {
         let project_dir = self.inner.project_dir.clone();
         let append_dir = current_append_dir.to_string();
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        let decode = move || {
             let result = decode_koe_no_for_project(&project_dir, koe_no)
                 .and_then(|wav| crate::audio::jitan::convert_koe_wav(wav, jitan_rate))
                 .map_err(|err| format!("{err:#}"));
             let _ = tx.send(result);
-        });
+        };
+        // wasm32-unknown-unknown cannot spawn threads (the spawn panics and
+        // takes the VM down on the first voiced line). Decode inline there;
+        // the result goes through the same channel, so the pending_decode
+        // polling below is identical on every target.
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        decode();
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        std::thread::spawn(decode);
         self.pending_decode = Some((cache_key, append_dir, rx));
         Ok(())
     }

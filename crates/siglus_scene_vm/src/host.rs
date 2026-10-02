@@ -457,6 +457,11 @@ impl SiglusHost {
         if self.native_messagebox_pending() {
             return;
         }
+        // SiglusEngine's mouse-move-by-key: an arrow puts the cursor on the
+        // next button. The key still reaches the script afterwards.
+        if let Some((x, y)) = self.vm.ctx.cursor_move_by_key(key) {
+            self.vm.ctx.on_mouse_move(x, y);
+        }
         self.vm.ctx.on_key_down(key);
         self.script_needs_pump = true;
     }

@@ -75,6 +75,11 @@ struct WasmApp {
     init_started: bool,
     init_error: Option<String>,
     exit_requested: bool,
+    /// Gameexe SCREEN_SIZE, read once the host is up: the space the VM and
+    /// its hit tests work in, whatever size the canvas is.
+    game_size: Option<(u32, u32)>,
+    /// Where the game sits on the surface (letterboxed), in surface pixels.
+    viewport: (u32, u32, u32, u32),
 }
 
 impl WasmApp {
@@ -89,7 +94,47 @@ impl WasmApp {
             init_started: false,
             init_error: None,
             exit_requested: false,
+            game_size: None,
+            viewport: (0, 0, 1, 1),
         }
+    }
+
+    /// Pins the renderer to the game's own resolution, letterboxed into the
+    /// surface, as the desktop host does. Left alone, the renderer derives its
+    /// logical size from surface / scale factor - the CSS canvas size, which
+    /// has nothing to do with the game - and draws in one space while the VM
+    /// computes in another.
+    fn fit_viewport(&mut self, surface_w: u32, surface_h: u32) {
+        let (Some(host), Some((game_w, game_h))) = (self.host.as_mut(), self.game_size) else {
+            return;
+        };
+        let (vx, vy, vw, vh) = aspect_fit_viewport(surface_w, surface_h, game_w, game_h);
+        host.resize_with_logical_viewport(
+            surface_w.max(1),
+            surface_h.max(1),
+            1.0,
+            game_w,
+            game_h,
+            vx,
+            vy,
+            vw,
+            vh,
+        );
+        self.viewport = (vx, vy, vw, vh);
+    }
+
+    /// A pointer position (surface pixels) in game coordinates. winit-web
+    /// reports physical pixels; `to_logical()` would give CSS pixels, which
+    /// are neither.
+    fn to_game(&self, x: f64, y: f64) -> (f64, f64) {
+        let Some((game_w, game_h)) = self.game_size else {
+            return (x, y);
+        };
+        let (vx, vy, vw, vh) = self.viewport;
+        (
+            (x - vx as f64) * game_w as f64 / vw.max(1) as f64,
+            (y - vy as f64) * game_h as f64 / vh.max(1) as f64,
+        )
     }
 
     fn ensure_created(&mut self, elwt: &dyn ActiveEventLoop) {
@@ -166,6 +211,28 @@ impl WasmApp {
     }
 
     fn handle_window_event(&mut self, event: WindowEvent, elwt: &dyn ActiveEventLoop) {
+        if self.host.is_none() {
+            return;
+        }
+        match &event {
+            WindowEvent::SurfaceResized(size) => {
+                self.fit_viewport(size.width, size.height);
+                return;
+            }
+            WindowEvent::PointerMoved { position, primary: true, .. }
+            | WindowEvent::PointerEntered { position, primary: true, .. } => {
+                let (x, y) = self.to_game(position.x, position.y);
+                if let Some(host) = self.host.as_mut() {
+                    host.mouse_move(x, y);
+                }
+                return;
+            }
+            _ => {}
+        }
+        let game_point = match &event {
+            WindowEvent::PointerButton { position, .. } => Some(self.to_game(position.x, position.y)),
+            _ => None,
+        };
         let Some(host) = self.host.as_mut() else {
             return;
         };
@@ -173,10 +240,6 @@ impl WasmApp {
             WindowEvent::CloseRequested => {
                 self.exit_requested = true;
                 elwt.exit();
-            }
-            WindowEvent::SurfaceResized(size) => {
-                let sf = self.window.map(|w| w.scale_factor() as f32).unwrap_or(1.0);
-                host.resize(size.width.max(1), size.height.max(1), sf);
             }
             WindowEvent::KeyboardInput {
                 event:
@@ -216,24 +279,6 @@ impl WasmApp {
             WindowEvent::Ime(winit::event::Ime::Commit(text)) => host.text_input(&text),
             WindowEvent::Ime(winit::event::Ime::Disabled) => host.ime_disabled(),
             WindowEvent::Ime(winit::event::Ime::Enabled) => {}
-            WindowEvent::PointerMoved {
-                position,
-                primary: true,
-                ..
-            }
-            | WindowEvent::PointerEntered {
-                position,
-                primary: true,
-                ..
-            } => {
-                let (x, y) = if let Some(w) = self.window {
-                    let p = position.to_logical::<f64>(w.scale_factor());
-                    (p.x, p.y)
-                } else {
-                    (position.x, position.y)
-                };
-                host.mouse_move(x, y);
-            }
             WindowEvent::PointerButton {
                 state,
                 button,
@@ -244,9 +289,9 @@ impl WasmApp {
                 let Some(button) = button.mouse_button() else {
                     return;
                 };
-                let point = position
-                    .to_logical::<f64>(self.window.map(|w| w.scale_factor()).unwrap_or(1.0));
-                host.mouse_move(point.x, point.y);
+                let _ = position;
+                let (x, y) = game_point.unwrap_or_default();
+                host.mouse_move(x, y);
                 if let Some(b) = map_mouse_button(button) {
                     match (state, b) {
                         (ElementState::Pressed, VmMouseButton::Left) => {
@@ -306,8 +351,11 @@ impl ApplicationHandler for WasmApp {
         };
         match result {
             Ok(host) => {
+                self.game_size = Some(host.logical_size());
                 self.host = Some(host);
                 if let Some(w) = self.window {
+                    let size = w.surface_size();
+                    self.fit_viewport(size.width, size.height);
                     w.request_redraw();
                 }
             }
@@ -340,6 +388,24 @@ impl ApplicationHandler for WasmApp {
         }
         elwt.set_control_flow(ControlFlow::Poll);
     }
+}
+
+fn aspect_fit_viewport(
+    surface_w: u32,
+    surface_h: u32,
+    logical_w: u32,
+    logical_h: u32,
+) -> (u32, u32, u32, u32) {
+    let sw = surface_w.max(1) as f64;
+    let sh = surface_h.max(1) as f64;
+    let lw = logical_w.max(1) as f64;
+    let lh = logical_h.max(1) as f64;
+    let scale = (sw / lw).min(sh / lh);
+    let vw = (lw * scale).round().max(1.0).min(sw) as u32;
+    let vh = (lh * scale).round().max(1.0).min(sh) as u32;
+    let vx = (surface_w.max(1).saturating_sub(vw)) / 2;
+    let vy = (surface_h.max(1).saturating_sub(vh)) / 2;
+    (vx, vy, vw, vh)
 }
 
 fn lookup_canvas(id: &str) -> Result<web_sys::HtmlCanvasElement, String> {
