@@ -2497,16 +2497,15 @@ impl CommandContext {
         *entry = (now, entry.1.saturating_add(1));
     }
 
-    /// Image names the script has been hit-testing: asked about often (a
-    /// one-off layout query does not count), and lately. "Lately" is long,
-    /// because once one item is under the cursor a script may test only that
-    /// one until it leaves; only images still on screen become targets.
-    fn script_hit_test_names(&self) -> HashSet<String> {
+    /// Image names the script has been hit-testing within the last
+    /// `within_ms`: asked about often, since a one-off layout query does not
+    /// count. Only images still on screen become targets.
+    fn script_hit_test_names(&self, within_ms: u128) -> HashSet<String> {
         let now = crate::platform_time::Instant::now();
         self.script_size_probes
             .iter()
             .filter(|(_, (last, count))| {
-                *count >= 5 && now.duration_since(*last).as_millis() <= 10_000
+                *count >= 5 && now.duration_since(*last).as_millis() <= within_ms
             })
             .map(|(name, _)| name.clone())
             .collect()
@@ -2540,11 +2539,16 @@ impl CommandContext {
             .has_mouse_position()
             .then(|| (self.input.mouse_x, self.input.mouse_y));
         let Some((mx, my)) = here else {
-            return Some(if dx + dy > 0 { targets[0] } else { targets[targets.len() - 1] });
+            return Some(targets[0]);
         };
         let current = targets
             .iter()
             .position(|&(x, y)| (x - mx).abs() <= 8 && (y - my).abs() <= 8);
+        if current.is_none() {
+            // Not on a button yet: start at the first in reading order - a
+            // menu's first item, a dialog's Yes - whichever arrow it was.
+            return Some(targets[0]);
+        }
 
         // The nearest button in the arrow's direction, weighing distance
         // along the arrow less than distance across it.
@@ -2577,21 +2581,54 @@ impl CommandContext {
     /// Screen centres of the buttons a click could act on right now: enabled
     /// action buttons, standalone or in a choice group that is running.
     fn button_targets(&mut self) -> Vec<(i32, i32)> {
+        // SELBTN choices, while they are up, are the only thing to pick.
+        if self.selbtn_accepts_input() && !self.globals.selbtn.choices.is_empty() {
+            let choices: Vec<(i32, i32)> = self
+                .globals
+                .selbtn
+                .choices
+                .iter()
+                .filter(|choice| Self::selbtn_choice_selectable(choice))
+                .map(|choice| {
+                    let (x, y) = choice.pos;
+                    let (w, h) = choice.size;
+                    ((x + w.max(1) / 2) as i32, (y + h.max(1) / 2) as i32)
+                })
+                .collect();
+            if !choices.is_empty() {
+                return choices;
+            }
+        }
         let buttons = self.collect_targets(None);
         if !buttons.is_empty() {
-            return buttons;
+            return top_most(buttons);
         }
         // No engine buttons: a script-driven menu, if the script is
         // hit-testing images itself.
-        let probed = self.script_hit_test_names();
-        if probed.is_empty() {
-            return buttons;
+        // The images it is testing right now are exactly the live ones (a
+        // whole menu, or just the dialog on top of it)...
+        let active = self.script_hit_test_names(300);
+        if active.len() >= 2 {
+            return self
+                .collect_targets(Some(&active))
+                .into_iter()
+                .map(|(point, _)| point)
+                .collect();
         }
-        self.collect_targets(Some(&probed))
+        // ...unless it has locked onto the one under the cursor, which some
+        // scripts do until it leaves. Then go by what it tested lately, and
+        // with a dialog among those, its layer.
+        let lately = self.script_hit_test_names(10_000);
+        if lately.is_empty() {
+            return Vec::new();
+        }
+        top_most(self.collect_targets(Some(&lately)))
     }
 
-    /// Engine buttons, or with `probed`, the visible images by those names.
-    fn collect_targets(&mut self, probed: Option<&HashSet<String>>) -> Vec<(i32, i32)> {
+    fn collect_targets(
+        &mut self,
+        probed: Option<&HashSet<String>>,
+    ) -> Vec<((i32, i32), ButtonSortKey)> {
         let mut out = Vec::new();
         let Some(form_id) = self.active_button_stage_form_id() else {
             return out;
@@ -2652,6 +2689,7 @@ impl CommandContext {
                     obj_idx,
                     obj,
                     None,
+                    ButtonSortKey { order: 0, layer: 0 },
                     &mut out,
                 );
             }
@@ -10133,6 +10171,22 @@ fn object_button_push_keep_recursive(
         .any(|child| object_button_push_keep_recursive(child, group_idx, button_no))
 }
 
+/// Only the top-most targets: with a dialog up (Save? Yes / No), the screen
+/// behind it still has live buttons, and a click there would land on the
+/// dialog anyway - the hit test takes the highest order and layer too.
+fn top_most(targets: Vec<((i32, i32), ButtonSortKey)>) -> Vec<(i32, i32)> {
+    let top = targets
+        .iter()
+        .map(|(_, key)| (key.order, key.layer))
+        .max()
+        .unwrap_or((0, 0));
+    targets
+        .into_iter()
+        .filter(|(_, key)| (key.order, key.layer) == top)
+        .map(|(point, _)| point)
+        .collect()
+}
+
 /// The screen point at the middle of a sprite's hit box - the inverse of
 /// hit_test_render_sprite for its centre (rotation ignored), kept inside the
 /// sprite's clip.
@@ -10200,8 +10254,16 @@ fn collect_button_targets_recursive(
     obj_idx: usize,
     obj: &globals::ObjectState,
     parent_state: Option<ParentRenderState>,
-    out: &mut Vec<(i32, i32)>,
+    parent_sort: ButtonSortKey,
+    out: &mut Vec<((i32, i32), ButtonSortKey)>,
 ) {
+    let runtime_slot = object_runtime_slot(obj_idx, obj);
+    let own_sort = object_button_sort_key(ids, gfx, stage_idx, runtime_slot, obj);
+    // Native m_trp.sorter adds each ancestor's order and layer.
+    let sort = ButtonSortKey {
+        order: own_sort.order.saturating_add(parent_sort.order),
+        layer: own_sort.layer.saturating_add(parent_sort.layer),
+    };
     let wanted = match probed {
         Some(names) => obj.file_name.as_ref().is_some_and(|name| names.contains(name)),
         None => true,
@@ -10219,7 +10281,6 @@ fn collect_button_targets_recursive(
         && object_button_renderable_by_syscom(syscom, obj)
         && (probed.is_some() || !button_effective_disabled(syscom, obj, None, read_skip_runtime_enabled))
     {
-        let runtime_slot = object_runtime_slot(obj_idx, obj);
         let info = button_object_render_info(ids, gfx, stage_idx, obj_idx, obj);
         for mut rs in fetch_bound_render_sprites_for_hit(layers, gfx, stage_idx, runtime_slot, obj) {
             apply_button_object_render_info_to_sprite(&mut rs.sprite, &info);
@@ -10229,7 +10290,7 @@ fn collect_button_targets_recursive(
             }
             finalize_button_object_center_rep_to_sprite(&mut rs.sprite, &info);
             if let Some(point) = render_sprite_center(images, &rs.sprite) {
-                out.push(point);
+                out.push((point, sort));
                 break;
             }
         }
@@ -10253,6 +10314,7 @@ fn collect_button_targets_recursive(
             child_idx,
             child,
             Some(cur_parent_state.clone()),
+            sort,
             out,
         );
     }
