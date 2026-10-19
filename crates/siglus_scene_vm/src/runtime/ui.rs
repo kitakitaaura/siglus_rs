@@ -34,6 +34,29 @@ struct UiWindowAnim {
     pivot_abs_y: f32,
 }
 
+// noberu: how much of the message window's text has gone to the reading
+// tools, and the call that sends it (window.NoberuSay, from noberu's
+// assets/runtime.js).
+thread_local! {
+    static NOBERU_SENT: std::cell::Cell<usize> = std::cell::Cell::new(0);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn noberu_say(text: &str, name: &str) {
+    use wasm_bindgen::{JsCast, JsValue};
+    let Some(window) = web_sys::window() else { return };
+    let Ok(say) = js_sys::Reflect::get(&window, &JsValue::from_str("NoberuSay")) else { return };
+    let Some(say) = say.dyn_ref::<js_sys::Function>() else { return };
+    let line = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&line, &JsValue::from_str("text"), &JsValue::from_str(text));
+    let _ = js_sys::Reflect::set(&line, &JsValue::from_str("name"), &JsValue::from_str(name));
+    let _ = js_sys::Reflect::set(&line, &JsValue::from_str("kind"), &JsValue::from_str("line"));
+    let _ = say.call1(&JsValue::NULL, &line);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn noberu_say(_text: &str, _name: &str) {}
+
 #[derive(Debug, Clone, Copy)]
 pub struct MwndWindowRenderState {
     pub x: i32,
@@ -2776,6 +2799,7 @@ impl UiRuntime {
     }
 
     pub fn clear_message(&mut self) {
+        NOBERU_SENT.with(|sent| sent.set(0));
         self.mwnd.key_icon.appear = false;
         if self.mwnd.msg.text.is_none() && self.mwnd.msg.glyphs.is_empty() {
             return;
@@ -2791,6 +2815,18 @@ impl UiRuntime {
     }
 
     pub fn begin_message_reveal_wait(&mut self) {
+        // noberu: the text added since the last click wait is a line for the
+        // reading tools in the page around the game.
+        let text = self.mwnd.msg.text.as_deref().unwrap_or("");
+        NOBERU_SENT.with(|sent| {
+            let from = sent.get().min(text.len());
+            let from = (from..=text.len()).find(|&i| text.is_char_boundary(i)).unwrap_or(text.len());
+            let fresh = &text[from..];
+            if !fresh.trim().is_empty() {
+                noberu_say(fresh.trim(), self.mwnd.name.text.as_deref().unwrap_or(""));
+            }
+            sent.set(text.len());
+        });
         self.mwnd.msg.waiting = true;
         self.mwnd.msg.wait_started_at = Some(Instant::now());
         self.mwnd.msg.wait_message_len =
