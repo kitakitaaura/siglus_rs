@@ -1735,6 +1735,28 @@ fn dispatch_global_wipe_command(
     Ok(true)
 }
 
+fn capture_image_from_file(
+    ctx: &mut CommandContext,
+    args: &[Value],
+) -> Result<crate::assets::RgbaImage> {
+    let Some(file) = args.first().and_then(|v| v.as_str()) else {
+        anyhow::bail!("no file name");
+    };
+    let Some(path) =
+        stage::resolve_capture_file_path(&ctx.project_dir, &ctx.globals.append_dir, file)
+    else {
+        anyhow::bail!("cannot find {file}");
+    };
+    let img_id = ctx
+        .images
+        .load_file(&path, 0)
+        .map_err(|e| anyhow::anyhow!("load {}: {e:#}", path.display()))?;
+    ctx.images
+        .get(&img_id)
+        .map(|img| img.as_ref().clone())
+        .ok_or_else(|| anyhow::anyhow!("image disappeared: {}", path.display()))
+}
+
 fn dispatch_capture_command(
     ctx: &mut CommandContext,
     form_id: u32,
@@ -1758,31 +1780,17 @@ fn dispatch_capture_command(
             Ok(true)
         }
         constants::elm_value::GLOBAL_CAPTURE_FROM_FILE => {
-            let Some(file) = args.first().and_then(|v| v.as_str()) else {
-                panic!("GLOBAL.CAPTURE_FROM_FILE requires file name");
-            };
-            let Some(path) =
-                stage::resolve_capture_file_path(&ctx.project_dir, &ctx.globals.append_dir, file)
-            else {
-                panic!("GLOBAL.CAPTURE_FROM_FILE cannot resolve file: {file}");
-            };
-            let img_id = ctx.images.load_file(&path, 0).unwrap_or_else(|e| {
-                panic!(
-                    "GLOBAL.CAPTURE_FROM_FILE failed to load {}: {e}",
-                    path.display()
-                )
-            });
-            let img = ctx
-                .images
-                .get(&img_id)
-                .map(|img| img.as_ref().clone())
-                .unwrap_or_else(|| {
-                    panic!(
-                        "GLOBAL.CAPTURE_FROM_FILE image disappeared: {}",
-                        path.display()
-                    )
-                });
-            crate::runtime::forms::syscom::prepare_runtime_save_thumb_capture_from_image(ctx, &img);
+            // noberu: a missing or unreadable capture file used to panic,
+            // which ends the game in the browser. Now it leaves the capture
+            // as it was and the script carries on.
+            match capture_image_from_file(ctx, args) {
+                Ok(img) => {
+                    crate::runtime::forms::syscom::prepare_runtime_save_thumb_capture_from_image(
+                        ctx, &img,
+                    );
+                }
+                Err(err) => log::warn!("GLOBAL.CAPTURE_FROM_FILE skipped: {err:#}"),
+            }
             ctx.push(Value::Int(0));
             Ok(true)
         }

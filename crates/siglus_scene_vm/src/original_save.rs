@@ -978,8 +978,49 @@ impl<'a> OriginalStreamReader<'a> {
     }
 }
 
+/// Languages whose Steam builds ship `Gameexe<LANG>.dat` / `Scene<LANG>.pck`
+/// next to a per-language save folder, `savedata_<lang>` (Rewrite+ in English:
+/// `GameexeEN.dat` and `savedata_en`).
+const LOCALIZED_SAVE_LANGS: &[&str] = &["en", "zh", "zhtw", "de", "es", "fr", "id"];
+
+/// The game's save folder.
+///
+/// `savedata`, as in the original engine, except for a localized Steam build
+/// whose `savedata_<lang>` folder already exists: that is where its own exe
+/// keeps saves, read flags and unlocks, so the player's progress carries over.
+/// A localized copy that was never run on Windows has no such folder yet and
+/// keeps using `savedata`.
 pub fn save_dir(project_dir: &Path) -> PathBuf {
-    project_dir.join("savedata")
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(dir) = cache.lock().ok().and_then(|c| c.get(project_dir).cloned()) {
+        return dir;
+    }
+    let dir = localized_save_dir(project_dir).unwrap_or_else(|| project_dir.join("savedata"));
+    if let Ok(mut c) = cache.lock() {
+        c.insert(project_dir.to_path_buf(), dir.clone());
+    }
+    dir
+}
+
+fn localized_save_dir(project_dir: &Path) -> Option<PathBuf> {
+    LOCALIZED_SAVE_LANGS.iter().find_map(|lang| {
+        let upper = lang.to_ascii_uppercase();
+        let localized = ["dat", "ini"].iter().any(|ext| {
+            let gameexe = project_dir.join(format!("Gameexe{upper}.{ext}"));
+            matches!(
+                crate::resource::resolve_windows_case_insensitive_file(&gameexe),
+                Ok(Some(_))
+            )
+        });
+        if !localized {
+            return None;
+        }
+        crate::resource::resolve_existing_dir(&project_dir.join(format!("savedata_{lang}")))
+    })
 }
 
 pub fn original_save_no(
@@ -1854,5 +1895,43 @@ mod local_layout_tests {
             rd.skip(start).unwrap();
             assert!(rd.detect_local_layout().is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod save_dir_tests {
+    use super::*;
+
+    fn project(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("siglus-save-dir-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn localized_build_uses_its_existing_save_folder() {
+        let dir = project("en");
+        fs::write(dir.join("GameexeEN.dat"), b"x").unwrap();
+        fs::create_dir_all(dir.join("savedata_en")).unwrap();
+        assert_eq!(save_dir(&dir), dir.join("savedata_en"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn localized_build_without_the_folder_keeps_savedata() {
+        let dir = project("en-fresh");
+        fs::write(dir.join("GameexeEN.dat"), b"x").unwrap();
+        assert_eq!(save_dir(&dir), dir.join("savedata"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plain_build_ignores_a_stray_localized_folder() {
+        let dir = project("plain");
+        fs::write(dir.join("Gameexe.dat"), b"x").unwrap();
+        fs::create_dir_all(dir.join("savedata_en")).unwrap();
+        assert_eq!(save_dir(&dir), dir.join("savedata"));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

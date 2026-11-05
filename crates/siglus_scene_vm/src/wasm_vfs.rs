@@ -40,6 +40,10 @@ extern "C" {
 
     #[wasm_bindgen(js_name = siglusWriteFile)]
     fn siglus_write_file(path: &str, data: &[u8]);
+
+    // noberu: deleting, copying and swapping save slots remove files.
+    #[wasm_bindgen(js_name = siglusRemoveFile)]
+    fn siglus_remove_file(path: &str);
 }
 
 /// Path-based filesystem surface used by the wasm port.
@@ -58,6 +62,8 @@ pub trait SiglusVfs {
     fn file_size(&self, path: &str) -> Result<u64>;
     /// Creates or replaces the file (saves). The host keeps it.
     fn write_all(&self, path: &str, data: &[u8]) -> Result<()>;
+    /// Deletes a file the engine wrote. A missing file is not an error.
+    fn remove(&self, path: &str) -> Result<()>;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -120,6 +126,15 @@ impl SiglusVfs for WasmDirectoryVfs {
             bail!("empty wasm resource path");
         }
         siglus_write_file(&normalized, data);
+        Ok(())
+    }
+
+    fn remove(&self, path: &str) -> Result<()> {
+        let normalized = normalize_siglus_path(path);
+        if normalized.is_empty() {
+            bail!("empty wasm resource path");
+        }
+        siglus_remove_file(&normalized);
         Ok(())
     }
 

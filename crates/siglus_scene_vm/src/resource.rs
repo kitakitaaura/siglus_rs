@@ -140,6 +140,47 @@ pub fn write_file_bytes(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Deletes a file the engine wrote (save slots, thumbnails). A missing file is
+/// not an error. On the browser build the host drops it from its store.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub fn remove_file(path: &Path) -> Result<()> {
+    crate::wasm_vfs::WasmDirectoryVfs::new().remove(&path_to_wasm_vfs(path))
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub fn remove_file(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
+        _ => Ok(()),
+    }
+}
+
+/// `fs::copy`. The browser host has no copy, so it is a read and a write.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub fn copy_file(src: &Path, dst: &Path) -> Result<()> {
+    let data = read_file_bytes(src)?;
+    write_file_bytes(dst, &data)
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub fn copy_file(src: &Path, dst: &Path) -> Result<()> {
+    fs::copy(src, dst)?;
+    Ok(())
+}
+
+/// `fs::rename`. On the browser build a copy, then removing the source.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub fn rename_file(src: &Path, dst: &Path) -> Result<()> {
+    copy_file(src, dst)?;
+    remove_file(src)
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub fn rename_file(src: &Path, dst: &Path) -> Result<()> {
+    fs::rename(src, dst)?;
+    Ok(())
+}
+
 /// `fs::create_dir_all`, except on the browser build, whose host storage is
 /// keyed by path and has no directories to make.
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -472,6 +513,24 @@ pub(crate) fn invalidate_game_path_cache(_path: &Path) {
     // Browser File objects are registered as an immutable snapshot for one
     // launch. Runtime-generated browser files are not currently inserted into
     // that JavaScript index.
+}
+
+/// An existing directory at `path`, matched without regard to case as on
+/// Windows. On wasm a directory exists when the picked folder or the save
+/// overlay has something in it.
+pub(crate) fn resolve_existing_dir(path: &Path) -> Option<PathBuf> {
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        return wasm_path_is_dir(path).then(|| path.to_path_buf());
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        resolve_windows_case_insensitive_path(path)
+            .ok()
+            .flatten()
+            .filter(|resolved| resolved.is_dir())
+    }
 }
 
 pub(crate) fn resolve_windows_case_insensitive_path(path: &Path) -> Result<Option<PathBuf>> {
